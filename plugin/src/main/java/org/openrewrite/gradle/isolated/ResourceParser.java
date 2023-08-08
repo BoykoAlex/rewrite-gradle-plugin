@@ -15,15 +15,12 @@
  */
 package org.openrewrite.gradle.isolated;
 
-import org.gradle.api.Project;
-import org.gradle.api.initialization.Settings;
 import org.gradle.api.logging.Logger;
 import org.gradle.api.logging.Logging;
-import org.gradle.invocation.DefaultGradle;
-import org.gradle.util.GradleVersion;
 import org.openrewrite.ExecutionContext;
 import org.openrewrite.SourceFile;
 import org.openrewrite.gradle.GradleParser;
+import org.openrewrite.gradle.ProjectInfo;
 import org.openrewrite.gradle.RewriteExtension;
 import org.openrewrite.groovy.GroovyParser;
 import org.openrewrite.hcl.HclParser;
@@ -55,7 +52,7 @@ public class ResourceParser {
     private static final Set<String> DEFAULT_IGNORED_DIRECTORIES = new HashSet<>(Arrays.asList("build", "target", "out", ".sonar", ".gradle", ".idea", ".project", "node_modules", ".git", ".metadata", ".DS_Store"));
     private static final Logger logger = Logging.getLogger(ResourceParser.class);
     private final Path baseDir;
-    private final Project project;
+    private final ProjectInfo project;
     private final Collection<PathMatcher> exclusions;
 
     private final JavaTypeCache typeCache;
@@ -65,7 +62,7 @@ public class ResourceParser {
     private final int sizeThresholdMb;
 
 
-    public ResourceParser(Path baseDir, Project project, RewriteExtension extension, JavaTypeCache typeCache) {
+    public ResourceParser(Path baseDir, ProjectInfo project, RewriteExtension extension, JavaTypeCache typeCache) {
         this.baseDir = baseDir;
         this.project = project;
         this.exclusions = pathMatchers(baseDir, mergeExclusions(project, baseDir, extension));
@@ -74,7 +71,7 @@ public class ResourceParser {
         this.sizeThresholdMb = extension.getSizeThresholdMb();
     }
 
-    private static Collection<String> mergeExclusions(Project project, Path baseDir, RewriteExtension extension) {
+    private static Collection<String> mergeExclusions(ProjectInfo project, Path baseDir, RewriteExtension extension) {
         return Stream.concat(
                 project.getSubprojects().stream()
                         .map(subproject -> separatorsToUnix(baseDir.relativize(subproject.getProjectDir().toPath()).toString())),
@@ -217,25 +214,12 @@ public class ResourceParser {
                 .build();
         List<Path> groovyPaths = new ArrayList<>();
 
-        List<Path> buildscriptClasspath = project.getBuildscript().getConfigurations().getByName("classpath").resolve()
+        List<Path> buildscriptClasspath = project.getBuildscriptClasspath()
                 .stream()
                 .map(File::toPath)
                 .collect(toList());
 
-        List<Path> settingsClasspath;
-        if (GradleVersion.current().compareTo(GradleVersion.version("4.4")) >= 0) {
-            try {
-                Settings settings = ((DefaultGradle) project.getGradle()).getSettings();
-                settingsClasspath = settings.getBuildscript().getConfigurations().getByName("classpath").resolve()
-                        .stream()
-                        .map(File::toPath)
-                        .collect(toList());
-            } catch (IllegalStateException e) {
-                settingsClasspath = emptyList();
-            }
-        } else {
-            settingsClasspath = emptyList();
-        }
+        List<Path> settingsClasspath = project.getSettingsClasspath().stream().map(f -> f.toPath()).collect(toList());
 
         GradleParser gradleParser = GradleParser.builder()
                 .groovyParser(GroovyParser.builder()

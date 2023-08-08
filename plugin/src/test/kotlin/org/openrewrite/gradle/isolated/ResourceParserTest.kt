@@ -20,6 +20,7 @@ import org.gradle.testfixtures.ProjectBuilder
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import org.openrewrite.gradle.DefaultRewriteExtension
+import org.openrewrite.gradle.ProjectInfo
 import org.openrewrite.java.internal.JavaTypeCache
 import java.io.File
 import kotlin.io.path.Path
@@ -43,11 +44,13 @@ class ResourceParserTest {
             .withParent(project)
             .build()
 
-        val rewriteExtension = DefaultRewriteExtension(project)
+        val projectInfo = ProjectInfo.from(project);
 
-        val resourceParser = ResourceParser(path, project, rewriteExtension, JavaTypeCache())
+        val rewriteExtension = DefaultRewriteExtension(projectInfo)
 
-        val sources = resourceParser.listSources(project.projectDir.toPath())
+        val resourceParser = ResourceParser(path, projectInfo, rewriteExtension, JavaTypeCache())
+
+        val sources = resourceParser.listSources(projectInfo.projectDir.toPath())
 
         Assertions.assertThat(sources.size).isEqualTo(1)
     }

@@ -41,7 +41,7 @@ public class RewritePlugin implements Plugin<Project> {
             // Moderne plugin provides superset of rewrite plugin functionality, no need to apply both
             return;
         }
-        RewriteExtension extension = project.getExtensions().create("rewrite", DefaultRewriteExtension.class, project);
+        RewriteExtension extension = project.getExtensions().create("rewrite", DefaultRewriteExtension.class, ProjectInfo.from(project));
 
         // Rewrite module dependencies put here will be available to all rewrite tasks
         Configuration rewriteConf = project.getConfigurations().maybeCreate("rewrite");

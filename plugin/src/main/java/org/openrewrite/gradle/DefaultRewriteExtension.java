@@ -15,8 +15,6 @@
  */
 package org.openrewrite.gradle;
 
-import org.gradle.api.Project;
-
 import javax.annotation.Nullable;
 import javax.inject.Provider;
 import java.io.File;
@@ -34,7 +32,8 @@ public class DefaultRewriteExtension implements RewriteExtension {
     private final List<String> activeRecipes = new ArrayList<>();
     private final List<String> activeStyles = new ArrayList<>();
     private boolean configFileSetDeliberately;
-    protected final Project project;
+    protected final ProjectInfo project;
+
     private File configFile;
 
     private Provider<File> checkstyleConfigProvider;
@@ -69,9 +68,9 @@ public class DefaultRewriteExtension implements RewriteExtension {
     private boolean throwOnParseFailures;
 
     @SuppressWarnings("unused")
-    public DefaultRewriteExtension(Project project) {
+    public DefaultRewriteExtension(ProjectInfo project) {
         this.project = project;
-        configFile = project.file("rewrite.yml");
+        configFile = new File(project.getProjectDir(), "rewrite.yml");
     }
 
     @Override
@@ -83,7 +82,7 @@ public class DefaultRewriteExtension implements RewriteExtension {
     @Override
     public void setConfigFile(String configFilePath) {
         configFileSetDeliberately = true;
-        configFile = project.file(configFilePath);
+        configFile = new File(project.getProjectDir(), configFilePath);
     }
 
     @Override

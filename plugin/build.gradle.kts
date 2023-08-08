@@ -112,10 +112,13 @@ dependencies {
     "rewriteDependencies"("com.puppycrawl.tools:checkstyle:9.3")
     "rewriteDependencies"("com.fasterxml.jackson.module:jackson-module-kotlin:latest.release")
 
+    compileOnly("org.projectlombok:lombok:1.18.28")
+    annotationProcessor("org.projectlombok:lombok:1.18.28")
+
     implementation(platform("org.openrewrite:rewrite-bom:$latest"))
     compileOnly("org.openrewrite:rewrite-core")
     compileOnly("org.openrewrite:rewrite-gradle")
-    compileOnly("org.openrewrite.gradle.tooling:model:$latest")
+    implementation("org.openrewrite.gradle.tooling:model:$latest")
     compileOnly("org.openrewrite:rewrite-groovy")
     compileOnly("org.openrewrite:rewrite-hcl")
     compileOnly("org.openrewrite:rewrite-java")
@@ -136,7 +139,7 @@ dependencies {
     //we declare rewrite dependencies as test runtime to avoid having to declare them as implementation dependencies
     testRuntimeOnly("org.openrewrite:rewrite-core")
     testRuntimeOnly("org.openrewrite:rewrite-gradle")
-    testRuntimeOnly("org.openrewrite.gradle.tooling:model:$latest")
+    testImplementation("org.openrewrite.gradle.tooling:model:$latest")
     testRuntimeOnly("org.openrewrite:rewrite-groovy")
     testRuntimeOnly("org.openrewrite:rewrite-hcl")
     testImplementation("org.openrewrite:rewrite-java")

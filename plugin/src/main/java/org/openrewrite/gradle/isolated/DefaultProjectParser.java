@@ -19,37 +19,24 @@ import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.binder.jvm.JvmHeapPressureMetrics;
 import io.micrometer.core.instrument.binder.jvm.JvmMemoryMetrics;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
-import org.gradle.api.NamedDomainObjectContainer;
 import org.gradle.api.Project;
-import org.gradle.api.artifacts.Configuration;
-import org.gradle.api.file.SourceDirectorySet;
-import org.gradle.api.initialization.Settings;
 import org.gradle.api.internal.tasks.userinput.UserInputHandler;
 import org.gradle.api.logging.Logger;
 import org.gradle.api.logging.Logging;
 import org.gradle.api.plugins.GroovyPlugin;
-import org.gradle.api.plugins.JavaPluginConvention;
-import org.gradle.api.tasks.SourceSet;
-import org.gradle.api.tasks.compile.JavaCompile;
 import org.gradle.internal.service.ServiceRegistry;
-import org.gradle.invocation.DefaultGradle;
 import org.gradle.util.GradleVersion;
-import org.jetbrains.kotlin.gradle.plugin.KotlinSourceSet;
 import org.openrewrite.*;
 import org.openrewrite.binary.Binary;
 import org.openrewrite.config.Environment;
 import org.openrewrite.config.OptionDescriptor;
 import org.openrewrite.config.RecipeDescriptor;
 import org.openrewrite.config.YamlResourceLoader;
-import org.openrewrite.gradle.DefaultRewriteExtension;
-import org.openrewrite.gradle.GradleProjectParser;
-import org.openrewrite.gradle.RewriteExtension;
-import org.openrewrite.gradle.SanitizedMarkerPrinter;
+import org.openrewrite.gradle.*;
 import org.openrewrite.gradle.isolated.ui.RecipeDescriptorTreePrompter;
 import org.openrewrite.gradle.marker.GradleProject;
 import org.openrewrite.gradle.marker.GradleProjectBuilder;
 import org.openrewrite.gradle.marker.GradleSettings;
-import org.openrewrite.gradle.marker.GradleSettingsBuilder;
 import org.openrewrite.groovy.GroovyParser;
 import org.openrewrite.internal.InMemoryLargeSourceSet;
 import org.openrewrite.internal.ListUtils;
@@ -85,7 +72,6 @@ import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static java.util.Collections.emptySet;
 import static java.util.stream.Collectors.*;
 import static org.openrewrite.Tree.randomId;
 
@@ -97,13 +83,17 @@ public class DefaultProjectParser implements GradleProjectParser {
     private final AtomicBoolean firstWarningLogged = new AtomicBoolean(false);
     protected final Path baseDir;
     protected final RewriteExtension extension;
-    protected final Project project;
+    protected final ProjectInfo project;
     private final List<Marker> sharedProvenance;
 
     private List<NamedStyles> styles;
     private Environment environment;
 
     public DefaultProjectParser(Project project, RewriteExtension extension) {
+        this(ProjectInfo.from(project), extension);
+    }
+
+    public DefaultProjectParser(ProjectInfo project, RewriteExtension extension) {
         this.baseDir = repositoryRoot(project);
         this.extension = extension;
         this.project = project;
@@ -113,7 +103,7 @@ public class DefaultProjectParser implements GradleProjectParser {
                         buildEnvironment,
                         gitProvenance(baseDir, buildEnvironment),
                         OperatingSystemProvenance.current(),
-                        new BuildTool(randomId(), BuildTool.Type.Gradle, project.getGradle().getGradleVersion()))
+                        new BuildTool(randomId(), BuildTool.Type.Gradle, project.getGradleVersion()))
                 .filter(Objects::nonNull)
                 .collect(Collectors.toList());
     }
@@ -123,8 +113,8 @@ public class DefaultProjectParser implements GradleProjectParser {
      * Many Gradle builds co-locate the build root with the git repository root, but that is not required.
      * If no git repository can be located in any folder containing the build, the build root will be returned.
      */
-    static Path repositoryRoot(Project project) {
-        Path buildRoot = project.getRootProject().getProjectDir().toPath();
+    static Path repositoryRoot(ProjectInfo project) {
+        Path buildRoot = project.getRootProjectDir().toPath();
         Path maybeBaseDir = buildRoot;
         while (maybeBaseDir != null && !Files.exists(maybeBaseDir.resolve(".git"))) {
             maybeBaseDir = maybeBaseDir.getParent();
@@ -273,17 +263,14 @@ public class DefaultProjectParser implements GradleProjectParser {
             throw new UncheckedIOException(e);
         }
         //noinspection deprecation
-        JavaPluginConvention javaConvention = project.getConvention().findPlugin(JavaPluginConvention.class);
-        if (javaConvention != null) {
-            for (SourceSet sourceSet : javaConvention.getSourceSets()) {
-                sourceSet.getAllJava().getFiles().stream()
+            for (ProjectInfo.SourceSetInfo sourceSet : project.getSourceSets()) {
+                sourceSet.getJava().stream()
                         .filter(it -> it.isFile() && (it.getName().endsWith(".java") || it.getName().endsWith(".kt")))
                         .map(File::toPath)
                         .map(Path::toAbsolutePath)
                         .map(Path::normalize)
                         .forEach(result::add);
             }
-        }
         return result;
     }
 
@@ -381,7 +368,8 @@ public class DefaultProjectParser implements GradleProjectParser {
                 logger.warn("    {}", reportPath.normalize());
                 logger.warn("Run 'gradle rewriteRun' to apply the recipes.");
 
-                if (project.getExtensions().getByType(DefaultRewriteExtension.class).getFailOnDryRunResults()) {
+                DefaultRewriteExtension ext = project.getExtensionByType(DefaultRewriteExtension.class);
+                if (ext != null && ext.getFailOnDryRunResults()) {
                     throw new RuntimeException("Applying recipes would make changes. See logs for more details.");
                 }
             } else {
@@ -590,8 +578,8 @@ public class DefaultProjectParser implements GradleProjectParser {
     public Stream<SourceFile> parse(ExecutionContext ctx) {
         Stream<SourceFile> builder = Stream.of();
         Set<Path> alreadyParsed = new HashSet<>();
-        if (project == project.getRootProject()) {
-            for (Project subProject : project.getSubprojects()) {
+        if (project.isRootProject()) {
+            for (ProjectInfo subProject : project.getSubprojects()) {
                 builder = Stream.concat(builder, parse(subProject, alreadyParsed, ctx));
             }
         }
@@ -601,76 +589,60 @@ public class DefaultProjectParser implements GradleProjectParser {
         return builder.map(this::logParseErrors);
     }
 
-    public Stream<SourceFile> parse(Project subproject, Set<Path> alreadyParsed, ExecutionContext ctx) {
+    public Stream<SourceFile> parse(ProjectInfo subproject, Set<Path> alreadyParsed, ExecutionContext ctx) {
         Collection<PathMatcher> exclusions = extension.getExclusions().stream()
                 .map(pattern -> subproject.getProjectDir().toPath().getFileSystem().getPathMatcher("glob:" + pattern))
                 .collect(toList());
         if (isExcluded(exclusions, subproject.getProjectDir().toPath())) {
-            logger.lifecycle("Skipping project {} because it is excluded", subproject.getName());
+            logger.lifecycle("Skipping project {} because it is excluded", subproject.getGradleProjectToolingModel().getName());
             return Stream.empty();
         }
 
         try {
-            logger.lifecycle("Scanning sources in project {}", subproject.getName());
+            logger.lifecycle("Scanning sources in project {}", subproject.getGradleProjectToolingModel().getName());
             List<NamedStyles> styles = getStyles();
             @SuppressWarnings("deprecation")
-            JavaPluginConvention javaConvention = subproject.getConvention().findPlugin(JavaPluginConvention.class);
-            Set<SourceSet> sourceSets;
+            Collection<ProjectInfo.SourceSetInfo> sourceSets = subproject.getSourceSets();
             List<Marker> projectProvenance;
-            if (javaConvention == null) {
+            if (sourceSets.isEmpty()) {
                 projectProvenance = sharedProvenance;
-                sourceSets = Collections.emptySet();
             } else {
                 projectProvenance = new ArrayList<>(sharedProvenance);
-                projectProvenance.add(new JavaProject(randomId(), subproject.getName(),
-                        new JavaProject.Publication(subproject.getGroup().toString(),
-                                subproject.getName(),
-                                subproject.getVersion().toString())));
-                sourceSets = javaConvention.getSourceSets();
+                projectProvenance.add(new JavaProject(randomId(), subproject.getGradleProjectToolingModel().getName(),
+                        new JavaProject.Publication(subproject.getGradleProjectToolingModel().getGroup().toString(),
+                                subproject.getGradleProjectToolingModel().getName(),
+                                subproject.getGradleProjectToolingModel().getVersion().toString())));
+            }
+
+            //noinspection DataFlowIssue
+            if (subproject.isMultiPlatformKotlinProject()) {
+                return parseMultiplatformKotlinProject(subproject, exclusions, alreadyParsed, projectProvenance, ctx);
             }
 
             Stream<SourceFile> sourceFiles = Stream.of();
-            //noinspection DataFlowIssue
-            if (subproject.getPlugins().hasPlugin("org.jetbrains.kotlin.gradle.dsl.KotlinMultiplatformExtension") ||
-                subproject.getExtensions().findByName("kotlin") != null && subproject.getExtensions().findByName("kotlin").getClass().getCanonicalName().startsWith("org.jetbrains.kotlin.gradle.dsl.KotlinMultiplatformExtension")) {
-                sourceFiles = parseMultiplatformKotlinProject(subproject, exclusions, alreadyParsed, projectProvenance, ctx);
-            }
-
-            for (SourceSet sourceSet : sourceSets) {
+            for (ProjectInfo.SourceSetInfo sourceSet : sourceSets) {
                 Stream<SourceFile> sourceSetSourceFiles = Stream.of();
                 JavaTypeCache javaTypeCache = new JavaTypeCache();
-                JavaCompile javaCompileTask = (JavaCompile) subproject.getTasks().getByName(sourceSet.getCompileJavaTaskName());
-                JavaVersion javaVersion = new JavaVersion(randomId(), System.getProperty("java.runtime.version"),
-                        System.getProperty("java.vm.vendor"),
-                        javaCompileTask.getSourceCompatibility(),
-                        javaCompileTask.getTargetCompatibility());
+                JavaVersion javaVersion = new JavaVersion(
+                        Tree.randomId(),
+                        sourceSet.getJavaVersionInfo().getCreatedBy(),
+                        sourceSet.getJavaVersionInfo().getVmVendor(),
+                        sourceSet.getJavaVersionInfo().getSourceCompatibility(),
+                        sourceSet.getJavaVersionInfo().getTargetCompatibility()
+                );
 
-                List<Path> javaPaths = sourceSet.getAllJava().getFiles().stream()
+                List<Path> javaPaths = sourceSet.getJava().stream()
                         .filter(it -> it.isFile() && it.getName().endsWith(".java"))
                         .map(File::toPath)
                         .map(Path::toAbsolutePath)
                         .map(Path::normalize)
                         .collect(toList());
 
-                // classpath doesn't include the transitive dependencies of the implementation configuration
-                // These aren't needed for compilation, but we want them so recipes have access to comprehensive type information
-                // The implementation configuration isn't resolvable, so we need a new configuration that extends from it
-                Configuration implementation = subproject.getConfigurations().getByName(sourceSet.getImplementationConfigurationName());
-                Configuration rewriteImplementation = subproject.getConfigurations().maybeCreate("rewrite" + sourceSet.getImplementationConfigurationName());
-                rewriteImplementation.extendsFrom(implementation);
-
-                Set<File> implementationClasspath;
-                try {
-                    implementationClasspath = rewriteImplementation.resolve();
-                } catch (Exception e) {
-                    logger.warn("Failed to resolve dependencies from {}:{}. Some type information may be incomplete",
-                            subproject.getPath(), sourceSet.getImplementationConfigurationName());
-                    implementationClasspath = emptySet();
-                }
+                Collection<File> implementationClasspath = sourceSet.getImplementationClasspath();
 
                 // The implementation configuration doesn't include build/source directories from project dependencies
                 // So mash it and our rewriteImplementation together to get everything
-                List<Path> dependencyPaths = Stream.concat(implementationClasspath.stream(), sourceSet.getCompileClasspath().getFiles().stream())
+                List<Path> dependencyPaths = Stream.concat(implementationClasspath.stream(), sourceSet.getCompileClasspath().stream())
                         .map(File::toPath)
                         .map(Path::toAbsolutePath)
                         .map(Path::normalize)
@@ -698,11 +670,18 @@ public class DefaultProjectParser implements GradleProjectParser {
                             .filter(Objects::nonNull)
                             .map(it -> it.withMarkers(it.getMarkers().add(javaVersion)));
                     sourceSetSourceFiles = Stream.concat(sourceSetSourceFiles, cus);
-                    logger.info("Scanned {} Java sources in {}/{}", javaPaths.size(), subproject.getName(), sourceSet.getName());
+                    logger.info("Scanned {} Java sources in {}/{}", javaPaths.size(), subproject.getGradleProjectToolingModel().getName(), sourceSet.getName());
                 }
 
-                if (subproject.getPlugins().hasPlugin("org.jetbrains.kotlin.jvm")) {
-                    List<Path> kotlinPaths = sourceSet.getAllSource().getFiles().stream()
+                ResourceParser rp = new ResourceParser(baseDir, subproject, extension, javaTypeCache);
+                for (File resourcesDir : sourceSet.getSourceDirectories()) {
+                    if (resourcesDir.exists()) {
+                        sourceSetSourceFiles = Stream.concat(sourceSetSourceFiles, rp.parse(resourcesDir.toPath(), alreadyParsed, ctx));
+                    }
+                }
+
+                if (subproject.getGradleProjectToolingModel().getPlugins().stream().anyMatch(pd -> "org.jetbrains.kotlin.jvm".equals(pd.getId()))) {
+                    List<Path> kotlinPaths = sourceSet.getSources().stream()
                             .filter(it -> it.isFile() && it.getName().endsWith(".kt"))
                             .map(File::toPath)
                             .map(Path::toAbsolutePath)
@@ -729,12 +708,12 @@ public class DefaultProjectParser implements GradleProjectParser {
                                 .filter(Objects::nonNull)
                                 .map(it -> it.withMarkers(it.getMarkers().add(javaVersion)));
                         sourceSetSourceFiles = Stream.concat(sourceSetSourceFiles, cus);
-                        logger.info("Scanned {} Kotlin sources in {}/{}", kotlinPaths.size(), subproject.getName(), sourceSet.getName());
+                        logger.info("Scanned {} Kotlin sources in {}/{}", kotlinPaths.size(), subproject.getGradleProjectToolingModel().getName(), sourceSet.getName());
                     }
                 }
 
-                if (subproject.getPlugins().hasPlugin(GroovyPlugin.class)) {
-                    List<Path> groovyPaths = sourceSet.getAllSource().getFiles().stream()
+                if (subproject.getGradleProjectToolingModel().getPlugins().stream().anyMatch(pd -> pd.getFullyQualifiedClassName().equals(GroovyPlugin.class.getName()))) {
+                    List<Path> groovyPaths = sourceSet.getSources().stream()
                             .filter(it -> it.isFile() && it.getName().endsWith(".groovy"))
                             .map(File::toPath)
                             .map(Path::toAbsolutePath)
@@ -746,7 +725,7 @@ public class DefaultProjectParser implements GradleProjectParser {
                         // Include the build directory containing class files so these definitions are available
                         List<Path> dependenciesWithBuildDirs = Stream.concat(
                                 dependencyPaths.stream(),
-                                sourceSet.getOutput().getClassesDirs().getFiles().stream().map(File::toPath)
+                                sourceSet.getClassesDirs().stream().map(File::toPath)
                         ).collect(toList());
 
                         alreadyParsed.addAll(groovyPaths);
@@ -769,14 +748,7 @@ public class DefaultProjectParser implements GradleProjectParser {
                                 .filter(Objects::nonNull)
                                 .map(it -> it.withMarkers(it.getMarkers().add(javaVersion)));
                         sourceSetSourceFiles = Stream.concat(sourceSetSourceFiles, cus);
-                        logger.info("Scanned {} Groovy sources in {}/{}", groovyPaths.size(), subproject.getName(), sourceSet.getName());
-                    }
-                }
-
-                ResourceParser rp = new ResourceParser(baseDir, subproject, extension, javaTypeCache);
-                for (File resourcesDir : sourceSet.getResources().getSourceDirectories()) {
-                    if (resourcesDir.exists()) {
-                        sourceSetSourceFiles = Stream.concat(sourceSetSourceFiles, rp.parse(resourcesDir.toPath(), alreadyParsed, ctx));
+                        logger.info("Scanned {} Groovy sources in {}/{}", groovyPaths.size(), subproject.getGradleProjectToolingModel().getName(), sourceSet.getName());
                     }
                 }
 
@@ -789,15 +761,15 @@ public class DefaultProjectParser implements GradleProjectParser {
             sourceFiles = Stream.concat(sourceFiles, rp.parse(subproject.getProjectDir().toPath(), alreadyParsed, ctx).map(addProvenance(projectProvenance, null)));
 
             // Attach GradleProject marker to the build script
-            if (this.project.getBuildscript().getSourceFile() != null) {
-                Path buildScriptPath = baseDir.relativize(this.project.getBuildscript().getSourceFile().toPath());
+            if (this.project.getBuildscriptFile() != null) {
+                Path buildScriptPath = baseDir.relativize(this.project.getBuildscriptFile().toPath());
                 if (!isExcluded(exclusions, buildScriptPath)) {
                     sourceFiles = sourceFiles.map(sourceFile -> {
                         if (!sourceFile.getSourcePath().equals(buildScriptPath)) {
                             return sourceFile;
                         }
                         try {
-                            GradleProject gp = GradleProjectBuilder.gradleProject(subproject);
+                            GradleProject gp = GradleProject.fromToolingModel(project.getGradleProjectToolingModel());
                             return sourceFile.withMarkers(sourceFile.getMarkers().add(gp));
                         } catch (Exception e) {
                             // Gradle dependency resolution exceptions may be cyclic, which can be a problem for serialization
@@ -810,21 +782,15 @@ public class DefaultProjectParser implements GradleProjectParser {
             }
 
             if (GradleVersion.current().compareTo(GradleVersion.version("4.4")) >= 0) {
-                Settings settings = null;
-                try {
-                    settings = ((DefaultGradle) this.project.getGradle()).getSettings();
-                } catch (IllegalStateException e) {
-                    // ignore
-                }
-                if (settings != null && settings.getBuildscript().getSourceFile() != null) {
-                    Path settingsScriptPath = baseDir.relativize(settings.getBuildscript().getSourceFile().toPath());
+                if (this.project.getSettingsBuildscriptFile() != null) {
+                    Path settingsScriptPath = baseDir.relativize(this.project.getSettingsBuildscriptFile().toPath());
                     if (!isExcluded(exclusions, settingsScriptPath)) {
                         sourceFiles = sourceFiles.map(sourceFile -> {
                             if (!sourceFile.getSourcePath().equals(settingsScriptPath)) {
                                 return sourceFile;
                             }
                             try {
-                                GradleSettings gs = GradleSettingsBuilder.gradleSettings(((DefaultGradle) project.getGradle()).getSettings());
+                                GradleSettings gs = project.getGradleSettings();
                                 return sourceFile.withMarkers(sourceFile.getMarkers().add(gs));
                             } catch (Exception e) {
                                 RuntimeException sanitizedException = new RuntimeException(e.getMessage());
@@ -842,71 +808,21 @@ public class DefaultProjectParser implements GradleProjectParser {
         }
     }
 
-    private Stream<SourceFile> parseMultiplatformKotlinProject(Project subproject, Collection<PathMatcher> exclusions, Set<Path> alreadyParsed, List<Marker> projectProvenance, ExecutionContext ctx) {
-        Object kotlinExtension = subproject.getExtensions().getByName("kotlin");
-        NamedDomainObjectContainer<KotlinSourceSet> sourceSets;
-        try {
-            Class<?> clazz = kotlinExtension.getClass().getClassLoader().loadClass("org.jetbrains.kotlin.gradle.dsl.KotlinMultiplatformExtension");
-            //noinspection unchecked
-            sourceSets = (NamedDomainObjectContainer<KotlinSourceSet>) clazz.getMethod("getSourceSets")
-                    .invoke(kotlinExtension);
-
-        } catch (Exception e) {
-            logger.warn("Failed to resolve KotlinMultiplatformExtension from {}. No sources files from KotlinMultiplatformExtension will be parsed.",
-                    subproject.getPath());
-            return Stream.empty();
-        }
-
-        SortedSet<String> sourceSetNames;
-        try {
-            //noinspection unchecked
-            sourceSetNames = (SortedSet<String>) sourceSets.getClass().getMethod("getNames")
-                    .invoke(sourceSets);
-        } catch (Exception e) {
-            logger.warn("Failed to resolve SourceSetNames in KotlinMultiplatformExtension from {}. No sources files from KotlinMultiplatformExtension will be parsed.",
-                    subproject.getPath());
-            return Stream.empty();
-        }
-
+    private Stream<SourceFile> parseMultiplatformKotlinProject(ProjectInfo subproject, Collection<PathMatcher> exclusions, Set<Path> alreadyParsed, List<Marker> projectProvenance, ExecutionContext ctx) {
         Stream<SourceFile> sourceFiles = Stream.of();
-        for (String sourceSetName : sourceSetNames) {
+        for (ProjectInfo.KotlinSourceSetInfo sourceSet : subproject.getKotlinSourceSets()) {
             try {
-                Object sourceSet = sourceSets.getClass().getMethod("getByName", String.class)
-                        .invoke(sourceSets, sourceSetName);
-                SourceDirectorySet kotlinDirectorySet = (SourceDirectorySet) sourceSet.getClass().getMethod("getKotlin").invoke(sourceSet);
-                List<Path> kotlinPaths = kotlinDirectorySet.getFiles().stream()
+                List<Path> kotlinPaths = sourceSet.getKotlin().stream()
                         .filter(it -> it.isFile() && it.getName().endsWith(".kt"))
                         .map(File::toPath)
                         .map(Path::toAbsolutePath)
                         .map(Path::normalize)
                         .collect(toList());
 
-                // classpath doesn't include the transitive dependencies of the implementation configuration
-                // These aren't needed for compilation, but we want them so recipes have access to comprehensive type information
-                // The implementation configuration isn't resolvable, so we need a new configuration that extends from it
-                String implementationName = (String) sourceSet.getClass().getMethod("getImplementationConfigurationName").invoke(sourceSet);
-                Configuration implementation = subproject.getConfigurations().getByName(implementationName);
-                Configuration rewriteImplementation = subproject.getConfigurations().maybeCreate("rewrite" + implementationName);
-                rewriteImplementation.extendsFrom(implementation);
-
-                Set<File> implementationClasspath;
-                try {
-                    implementationClasspath = rewriteImplementation.resolve();
-                } catch (Exception e) {
-                    logger.warn("Failed to resolve dependencies from {}:{}. Some type information may be incomplete",
-                            subproject.getPath(), implementationName);
-                    implementationClasspath = emptySet();
-                }
-
-                String compileName = (String) sourceSet.getClass().getMethod("getCompileOnlyConfigurationName").invoke(sourceSet);
-                Configuration compileOnly = subproject.getConfigurations().getByName(compileName);
-                Configuration rewriteCompileOnly = subproject.getConfigurations().maybeCreate("rewrite" + compileName);
-                rewriteCompileOnly.setCanBeResolved(true);
-                rewriteCompileOnly.extendsFrom(compileOnly);
 
                 // The implementation configuration doesn't include build/source directories from project dependencies
                 // So mash it and our rewriteImplementation together to get everything
-                List<Path> dependencyPaths = Stream.concat(implementationClasspath.stream(), rewriteCompileOnly.getFiles().stream())
+                List<Path> dependencyPaths = Stream.concat(sourceSet.getImplementationClasspath().stream(), sourceSet.getCompileClasspath().stream())
                         .map(File::toPath)
                         .map(Path::toAbsolutePath)
                         .map(Path::normalize)
@@ -930,15 +846,15 @@ public class DefaultProjectParser implements GradleProjectParser {
                         }
                         return cu;
                     }).filter(Objects::nonNull);
-                    JavaSourceSet sourceSetProvenance = JavaSourceSet.build(sourceSetName, dependencyPaths, javaTypeCache, false);
+                    JavaSourceSet sourceSetProvenance = JavaSourceSet.build(sourceSet.getName(), dependencyPaths, javaTypeCache, false);
 
                     sourceFiles = Stream.concat(sourceFiles, cus.map(addProvenance(projectProvenance, sourceSetProvenance)));
-                    logger.info("Scanned {} Kotlin sources in {}/{}", kotlinPaths.size(), subproject.getName(), kotlinDirectorySet.getName());
+                    logger.info("Scanned {} Kotlin sources in {}/{}", kotlinPaths.size(), subproject.getGradleProjectToolingModel().getName(), sourceSet.getName());
                 }
                 return sourceFiles;
             } catch (Exception e) {
                 logger.warn("Failed to resolve sourceSet from {}:{}. Some type information may be incomplete",
-                        subproject.getPath(), sourceSetName);
+                        subproject.getGradleProjectToolingModel().getPath(), sourceSet.getName());
             }
         }
 
